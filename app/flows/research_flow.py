@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from pydantic import BaseModel, Field
 from crewai import Task
 from crewai.flow.flow import Flow, listen, start
@@ -15,7 +15,9 @@ from app.schemas import (
     FlowResult,
     ResearchStatus
 )
+from app.services.callback_service import callback_service
 import structlog
+from datetime import datetime, UTC
 
 logger = structlog.get_logger()
 
@@ -29,6 +31,11 @@ class ResearchFlowState(BaseModel):
     llm_model: str = "gpt-4o-mini"
     perplexity_model: PerplexityModel = PerplexityModel.SONAR_PRO
     max_planning_tasks: int = 8
+    
+    # Callback fields
+    callback_enabled: bool = False
+    callback_url: Optional[str] = None
+    callback_data: Optional[Dict[str, Any]] = None
     
     # Planning results
     planning_result: ResearchPlanningResult = Field(default_factory=ResearchPlanningResult)
@@ -95,13 +102,21 @@ class ResearchFlow(Flow[ResearchFlowState]):
         llm_provider: LLMProvider,
         llm_model: str,
         perplexity_model: PerplexityModel,
-        max_planning_tasks: int = 8
+        max_planning_tasks: int = 8,
+        callback_enabled: bool = False,
+        callback_url: Optional[str] = None,
+        callback_data: Optional[Dict[str, Any]] = None
     ):
         """Set flow state parameters"""
         logger.info(f"⚙️ Setting flow state parameters",
                    research_id=research_id,
                    query=query[:50],
-                   directory_path=directory_path)
+                   directory_path=directory_path,
+                   callback_enabled=callback_enabled,
+                   callback_url=callback_url)
+        
+        logger.info(f"🔍 PERPLEXITY MODEL TRACKING: Flow state being set with model '{perplexity_model.value}'")
+        logger.info(f"📁 DIRECTORY PATH TRACKING: Flow state being set with directory_path '{directory_path}'")
         
         # Update state fields directly if accessible
         try:
@@ -113,6 +128,9 @@ class ResearchFlow(Flow[ResearchFlowState]):
                 self._state.llm_model = llm_model
                 self._state.perplexity_model = perplexity_model
                 self._state.max_planning_tasks = max_planning_tasks
+                self._state.callback_enabled = callback_enabled
+                self._state.callback_url = callback_url
+                self._state.callback_data = callback_data
                 logger.info(f"✅ Flow state updated successfully")
             else:
                 logger.warning(f"⚠️ Flow state not yet initialized")
@@ -127,8 +145,12 @@ class ResearchFlow(Flow[ResearchFlowState]):
         self.current_llm_model = llm_model
         self.current_perplexity_model = perplexity_model
         self.current_max_planning_tasks = max_planning_tasks
+        self.current_callback_enabled = callback_enabled
+        self.current_callback_url = callback_url
+        self.current_callback_data = callback_data
         
         logger.info(f"✅ Flow parameters stored successfully")
+        logger.info(f"🔍 PERPLEXITY MODEL TRACKING: Stored in fallback variables as '{self.current_perplexity_model.value}'")
     
     @start()
     def initialize_research(self) -> Dict[str, Any]:
@@ -181,12 +203,16 @@ class ResearchFlow(Flow[ResearchFlowState]):
             # Get max_planning_tasks with fallback
             max_planning_tasks = getattr(self.state, 'max_planning_tasks', None) if hasattr(self, 'state') and self.state else getattr(self, 'current_max_planning_tasks', 8)
             
+            # Get directory_path with fallback
+            directory_path = context.get('directory_path') or getattr(self, 'current_directory_path', '')
+            
             # Execute research planning using the planner agent
-            logger.info(f"📞 Calling planner agent...")
+            logger.info(f"📞 Calling planner agent with directory_path='{directory_path}'...")
             planning_result = await self.planner_agent.plan_research(
                 topic=query,
                 objective=f"Comprehensive research on: {query}",
                 research_id=research_id,
+                directory_path=directory_path,
                 db=self.db,
                 max_planning_tasks=max_planning_tasks
             )
@@ -316,6 +342,10 @@ class ResearchFlow(Flow[ResearchFlowState]):
                    tasks_count=len(investigation_structure),
                    directory_path=directory_path)
         
+        # Get the perplexity model from the flow state for logging
+        perplexity_model_for_logging = getattr(self.state, 'perplexity_model', None) if hasattr(self, 'state') and self.state else getattr(self, 'current_perplexity_model', PerplexityModel.SONAR_PRO)
+        logger.info(f"🔍 PERPLEXITY MODEL TRACKING: execute_research method will use model '{perplexity_model_for_logging.value if hasattr(perplexity_model_for_logging, 'value') else str(perplexity_model_for_logging)}'")
+        
         # Check if we should proceed with research or use existing content
         if not should_execute_research:
             logger.info("🔍 Checking for existing research content instead of executing new research")
@@ -371,43 +401,80 @@ class ResearchFlow(Flow[ResearchFlowState]):
                 
                 logger.info(f"✅ Successfully used existing research content: {len(virtual_files)} files created")
                 
+                # Store execution result with fallback
+                try:
+                    if hasattr(self, 'state') and self.state:
+                        self.state.execution_result = execution_result
+                        self.state.final_status = ResearchStatus.COMPLETED
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not update flow state: {e}")
+                
+                self.current_execution_result = execution_result
+                self.current_final_status = ResearchStatus.COMPLETED
+                
+                logger.info(f"🛑 FLOW STOPPED - Using existing content instead of new research",
+                           research_id=research_id,
+                           existing_files_created=len(virtual_files),
+                           directory_path=directory_path)
+                
+                return {
+                    "query": query,
+                    "research_id": research_id,
+                    "directory_path": directory_path,
+                    "status": "completed_with_existing_content",
+                    "message": f"Research completed using existing content: {len(execution_result.minio_files)} files created from existing research",
+                    "execution_stopped": True,
+                    "reason": "valid_existing_content_found",
+                    "existing_content_count": len(existing_content),
+                    "files_created": len(virtual_files)
+                }
+                
             else:
-                logger.info("⏭️ No valid existing content, skipping research execution")
+                logger.info("⏭️ No valid existing content, but research execution not recommended")
                 execution_result = ResearchExecutionResult(
                     completed_tasks=[],
                     failed_tasks=[],
                     minio_files=[],
                     success=True
                 )
-            
-            # Store execution result with fallback
-            try:
-                if hasattr(self, 'state') and self.state:
-                    self.state.execution_result = execution_result
-                    self.state.final_status = ResearchStatus.COMPLETED
-            except Exception as e:
-                logger.warning(f"⚠️ Could not update flow state: {e}")
-            
-            self.current_execution_result = execution_result
-            self.current_final_status = ResearchStatus.COMPLETED
-            
-            status_message = "completed_with_existing_content" if has_valid_content else "completed_without_execution"
-            message = f"Research completed using existing content: {len(execution_result.minio_files)} files created" if has_valid_content else "Research skipped due to existing similar research"
-            
-            return {
-                "query": query,
-                "research_id": research_id,
-                "directory_path": directory_path,
-                "status": status_message,
-                "message": message
-            }
+                
+                # Store execution result with fallback
+                try:
+                    if hasattr(self, 'state') and self.state:
+                        self.state.execution_result = execution_result
+                        self.state.final_status = ResearchStatus.COMPLETED
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not update flow state: {e}")
+                
+                self.current_execution_result = execution_result
+                self.current_final_status = ResearchStatus.COMPLETED
+                
+                logger.info(f"🛑 FLOW STOPPED - No research execution needed",
+                           research_id=research_id,
+                           reason="similar_research_exists_without_valid_content")
+                
+                return {
+                    "query": query,
+                    "research_id": research_id,
+                    "directory_path": directory_path,
+                    "status": "completed_without_execution",
+                    "message": "Research skipped due to existing similar research",
+                    "execution_stopped": True,
+                    "reason": "similar_research_exists_no_content"
+                }
         
         try:
             # Execute research tasks using the executor agent
             logger.info(f"📞 Calling executor agent with {len(investigation_structure)} tasks...")
+            
+            # Get the perplexity model from the flow state
+            perplexity_model = getattr(self.state, 'perplexity_model', None) if hasattr(self, 'state') and self.state else getattr(self, 'current_perplexity_model', PerplexityModel.SONAR_PRO)
+            logger.info(f"🔍 Using perplexity model for execution: {perplexity_model.value if hasattr(perplexity_model, 'value') else str(perplexity_model)}")
+            
             execution_result = await self.executor_agent.execute_research_tasks(
                 research_tasks=investigation_structure,
-                directory_path=directory_path
+                directory_path=directory_path,
+                perplexity_model=perplexity_model
             )
             
             logger.info(f"✅ Execution completed",
@@ -507,6 +574,129 @@ class ResearchFlow(Flow[ResearchFlowState]):
                 "error": str(e)
             }
     
+    @listen(execute_research)
+    async def handle_completion(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle research completion and send callbacks if enabled.
+        This step runs after research execution is complete.
+        """
+        query = context.get('query') or getattr(self, 'current_query', '')
+        research_id = context.get('research_id') or getattr(self, 'current_research_id', 0)
+        status = context.get('status', 'unknown')
+        
+        logger.info(f"🎯 Handling research completion",
+                   research_id=research_id,
+                   status=status,
+                   context_keys=list(context.keys()))
+        
+        # Check if this was an early flow termination
+        execution_stopped = context.get('execution_stopped', False)
+        stop_reason = context.get('reason', 'unknown')
+        
+        if execution_stopped:
+            logger.info(f"🛑 FLOW STOPPED EARLY - Processing early termination",
+                       research_id=research_id,
+                       stop_reason=stop_reason,
+                       status=status)
+            
+            # Log detailed information about why the flow stopped
+            if stop_reason == "valid_existing_content_found":
+                logger.info(f"🎉 EARLY COMPLETION - Valid existing content found and used",
+                           research_id=research_id,
+                           existing_content_count=context.get('existing_content_count', 0),
+                           files_created=context.get('files_created', 0),
+                           directory_path=context.get('directory_path', ''))
+            elif stop_reason == "similar_research_exists_no_content":
+                logger.info(f"⏭️ EARLY COMPLETION - Similar research exists but no valid content",
+                           research_id=research_id,
+                           directory_path=context.get('directory_path', ''))
+        
+        try:
+            # Get callback settings for logging purposes
+            callback_enabled = getattr(self.state, 'callback_enabled', None) if hasattr(self, 'state') and self.state else getattr(self, 'current_callback_enabled', False)
+            callback_url = getattr(self.state, 'callback_url', None) if hasattr(self, 'state') and self.state else getattr(self, 'current_callback_url', None)
+            
+            logger.info(f"📋 Research completion details",
+                       research_id=research_id,
+                       callback_enabled=callback_enabled,
+                       callback_url=callback_url,
+                       status=status,
+                       message=context.get('message', 'No message'),
+                       error=context.get('error', 'No error'),
+                       execution_stopped=execution_stopped,
+                       stop_reason=stop_reason,
+                       note="Callback will be sent by research_service after status update")
+            
+            # Special handling for different completion scenarios
+            if execution_stopped:
+                if stop_reason == "valid_existing_content_found":
+                    logger.info(f"✅ DEBUGGING - Early completion with existing content",
+                               research_id=research_id,
+                               files_created_from_existing=context.get('files_created', 0),
+                               directory_path=context.get('directory_path', ''),
+                               existing_content_used=context.get('existing_content_count', 0))
+                elif stop_reason == "similar_research_exists_no_content":
+                    logger.info(f"⏭️ DEBUGGING - Early completion, no new research needed",
+                               research_id=research_id,
+                               directory_path=context.get('directory_path', ''),
+                               reason="Similar research found but no valid content")
+            
+            # Check if there are any errors in the context
+            if context.get('error'):
+                logger.warning(f"⚠️ Research completed with error: {context.get('error')}")
+            
+            if status in ['failed', 'completed_with_errors']:
+                logger.warning(f"⚠️ Research completed with issues: status={status}")
+            elif status in ['completed_with_existing_content', 'completed_without_execution']:
+                logger.info(f"✅ Research completed early: status={status}")
+            else:
+                logger.info(f"✅ Research completed successfully: status={status}")
+            
+            # Return final context - callback will be sent by research_service
+            result = {
+                "query": query,
+                "research_id": research_id,
+                "status": status,
+                "callback_enabled": callback_enabled,
+                "callback_configured": callback_enabled and callback_url,
+                "message": context.get('message', 'Research completion handled - callback will be sent by research_service'),
+                "completion_timestamp": datetime.now(UTC).isoformat(),
+                "execution_stopped": execution_stopped,
+                "stop_reason": stop_reason
+            }
+            
+            # Add context-specific information to the result
+            if execution_stopped:
+                result.update({
+                    "early_termination": True,
+                    "termination_reason": stop_reason,
+                    "files_created": context.get('files_created', 0),
+                    "existing_content_count": context.get('existing_content_count', 0),
+                    "directory_path": context.get('directory_path', '')
+                })
+            
+            logger.info(f"✅ Handle completion finished successfully", 
+                       research_id=research_id,
+                       final_status=status,
+                       will_send_callback=callback_enabled and callback_url,
+                       early_termination=execution_stopped,
+                       termination_reason=stop_reason if execution_stopped else "normal_completion")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Error handling research completion: {e}", exc_info=True)
+            return {
+                "query": query,
+                "research_id": research_id,
+                "status": "completion_error",
+                "message": f"Error handling completion: {str(e)}",
+                "error": str(e),
+                "completion_timestamp": datetime.now(UTC).isoformat(),
+                "execution_stopped": execution_stopped,
+                "stop_reason": stop_reason
+            }
+    
 # Flow instance for external use
 def create_research_flow(
     llm_provider: LLMProvider = LLMProvider.OPENAI,
@@ -548,6 +738,9 @@ async def execute_research_flow(inputs: Dict[str, Any], db: Session = None) -> F
                llm_model=inputs.get("llm_model", "gpt-4o-mini"),
                perplexity_model=inputs.get("perplexity_model", "sonar-pro"))
     
+    logger.info(f"🔍 PERPLEXITY MODEL TRACKING: execute_research_flow received model '{inputs.get('perplexity_model', 'sonar-pro')}'")
+    logger.info(f"📁 DIRECTORY PATH TRACKING: execute_research_flow received directory_path '{inputs.get('directory_path', '')}'")
+    
     try:
         # Create flow instance with proper configuration
         logger.info(f"🏭 Creating flow instance...")
@@ -567,7 +760,10 @@ async def execute_research_flow(inputs: Dict[str, Any], db: Session = None) -> F
             llm_provider=LLMProvider(inputs.get("llm_provider", "openai")),
             llm_model=inputs.get("llm_model", "gpt-4o-mini"),
             perplexity_model=PerplexityModel(inputs.get("perplexity_model", "sonar-pro")),
-            max_planning_tasks=inputs.get("max_planning_tasks", 8)
+            max_planning_tasks=inputs.get("max_planning_tasks", 8),
+            callback_enabled=inputs.get("callback_enabled", False),
+            callback_url=inputs.get("callback_url", None),
+            callback_data=inputs.get("callback_data", None)
         )
         
         # Execute the flow using CrewAI's kickoff method

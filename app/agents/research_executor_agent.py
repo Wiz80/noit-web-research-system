@@ -26,6 +26,31 @@ async def perform_perplexity_research(query: str, perplexity_model: PerplexityMo
         if specific_prompt:
             enhanced_query = specific_prompt
             logger.info(f"📝 Using specific prompt provided by planner (length: {len(specific_prompt)} chars)")
+            
+            # Check if this is the original preserved query
+            if query == specific_prompt or len(specific_prompt) > 1000:
+                logger.info(f"🎯 DEBUGGING - This appears to be the ORIGINAL PRESERVED QUERY",
+                           query_equals_prompt=query == specific_prompt,
+                           prompt_length=len(specific_prompt),
+                           likely_preserved=True)
+                
+                # Check if it was preserved due to max_planning_tasks=1
+                if query == specific_prompt:
+                    logger.info(f"✅ DEBUGGING - Query preserved exactly (likely max_planning_tasks=1 or specific format detection)")
+                
+                # Log a preview of the preserved content to verify it contains format instructions
+                prompt_preview = specific_prompt[:300] + "..." if len(specific_prompt) > 300 else specific_prompt
+                logger.info(f"🔍 DEBUGGING - Preserved query preview: {prompt_preview}")
+                
+                # Check for format indicators in the preserved prompt
+                format_indicators = ["json", "formato json", "requisitos:", "similarity_score", "competitor_name"]
+                found_indicators = [indicator for indicator in format_indicators if indicator.lower() in specific_prompt.lower()]
+                logger.info(f"📋 DEBUGGING - Format indicators found in preserved query: {found_indicators}")
+            else:
+                logger.info(f"🔧 DEBUGGING - This appears to be a GENERATED SUB-TASK",
+                           query_equals_prompt=False,
+                           prompt_length=len(specific_prompt),
+                           likely_preserved=False)
         else:
             enhanced_query = f"""
             Research the following topic comprehensively: {query}
@@ -42,12 +67,18 @@ async def perform_perplexity_research(query: str, perplexity_model: PerplexityMo
             Use credible sources and provide specific details with proper context.
             """
             logger.info(f"📝 Using generic enhanced query (length: {len(enhanced_query)} chars)")
+            logger.info(f"⚠️ DEBUGGING - NO SPECIFIC PROMPT PROVIDED - Using generic fallback")
         
         # Perform the research using Perplexity
         logger.info(f"🌐 Calling Perplexity API...",
                    model=perplexity_model.value,
                    max_tokens=4000,
                    temperature=0.1)
+        
+        logger.info(f"📤 DEBUGGING - Query being sent to Perplexity:",
+                   query_length=len(enhanced_query),
+                   query_preview=enhanced_query[:200] + "..." if len(enhanced_query) > 200 else enhanced_query,
+                   full_query_first_100=enhanced_query[:100])
         
         research_result = await perplexity_service.search_and_research(
             query=enhanced_query,
@@ -59,14 +90,47 @@ async def perform_perplexity_research(query: str, perplexity_model: PerplexityMo
         logger.info(f"✅ Perplexity API call completed",
                    content_length=len(research_result.get('content', '')),
                    citations_count=len(research_result.get('citations', [])),
-                   tokens_used=research_result.get('tokens_used', 0))
+                   tokens_used=research_result.get('tokens_used', 0),
+                   api_success=research_result.get('success', False))
         
-        # Add timestamp
-        research_result['timestamp'] = datetime.utcnow().isoformat()
-        research_result['original_query'] = query
+        # Check if the research was actually successful and has content
+        api_success = research_result.get('success', False)
+        content = research_result.get('content', '')
+        has_content = bool(content and content.strip())
         
-        logger.info(f"📊 Research result prepared with metadata")
-        return research_result
+        # Log debugging info about content processing
+        if api_success and has_content:
+            logger.info(f"🧹 DEBUGGING - Content received from Perplexity",
+                       content_length=len(content),
+                       content_preview=content[:200] + "..." if len(content) > 200 else content,
+                       has_think_tags="<think>" in content.lower() or "</think>" in content.lower())
+        
+        if api_success and has_content:
+            logger.info(f"✅ Research successful with valid content ({len(content)} chars)")
+            
+            # Add timestamp and metadata
+            research_result['timestamp'] = datetime.now(UTC).isoformat()
+            research_result['original_query'] = query
+            research_result['success'] = True
+            
+            logger.info(f"📊 Research result prepared with metadata")
+            return research_result
+        else:
+            # Research failed or has no content
+            error_msg = research_result.get('error', 'No content returned from Perplexity API')
+            logger.error(f"❌ Research failed: API success={api_success}, has_content={has_content}, error={error_msg}")
+            
+            return {
+                "content": f"Research failed: {error_msg}",
+                "citations": [],
+                "model_used": perplexity_model.value,
+                "tokens_used": research_result.get('tokens_used', 0),
+                "query": query,
+                "success": False,
+                "error": error_msg,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "original_query": query
+            }
         
     except Exception as e:
         logger.error(f"❌ Error in Perplexity research: {e}")
@@ -78,7 +142,7 @@ async def perform_perplexity_research(query: str, perplexity_model: PerplexityMo
             "query": query,
             "success": False,
             "error": str(e),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "original_query": query
         }
 
@@ -377,7 +441,8 @@ class ResearchExecutorAgent:
     async def execute_research_tasks(
         self, 
         research_tasks: List['ResearchTaskStructure'], 
-        directory_path: str
+        directory_path: str,
+        perplexity_model: PerplexityModel = None
     ) -> ResearchExecutionResult:
         """
         Execute research tasks using service functions directly
@@ -385,16 +450,20 @@ class ResearchExecutorAgent:
         Args:
             research_tasks: List of ResearchTaskStructure objects with specific prompts
             directory_path: MinIO directory path to save results
+            perplexity_model: Optional perplexity model to use, defaults to agent's model
             
         Returns:
             ResearchExecutionResult with execution details
         """
         
+        # Use provided model or fall back to agent's default model
+        model_to_use = perplexity_model if perplexity_model is not None else self.perplexity_model
+        
         try:
             logger.info(f"🚀 Starting research execution",
                        total_tasks=len(research_tasks),
                        directory_path=directory_path,
-                       perplexity_model=self.perplexity_model.value)
+                       perplexity_model=model_to_use.value)
             
             # Execute only the first task by default for efficiency
             tasks_to_execute = research_tasks[:1]  # Limit to 1 task
@@ -414,15 +483,20 @@ class ResearchExecutorAgent:
                 try:
                     # Perform the research using service function with specific prompt
                     logger.info(f"🔍 Step 1: Performing Perplexity research with specific prompt...")
+                    logger.info(f"🔍 Using Perplexity model: {model_to_use.value}")
                     research_result = await perform_perplexity_research(
                         query=task_structure.task_question,
-                        perplexity_model=self.perplexity_model,
+                        perplexity_model=model_to_use,
                         specific_prompt=task_structure.specific_prompt
                     )
                     
-                    if research_result.get('success', True):  # Default to True if not specified
+                    # Check if research was successful
+                    research_success = research_result.get('success', False)
+                    research_content = research_result.get('content', '')
+                    
+                    if research_success and research_content.strip():
                         logger.info(f"✅ Research completed successfully for task {i}",
-                                   content_length=len(research_result.get('content', '')))
+                                   content_length=len(research_content))
                         
                         # Save to MinIO using service function
                         logger.info(f"💾 Step 2: Saving to MinIO...")
@@ -443,8 +517,11 @@ class ResearchExecutorAgent:
                                         error=save_result.get('message', 'Unknown error'))
                     else:
                         failed_tasks.append(task_structure)
+                        error_msg = research_result.get('error', 'No content returned')
                         logger.error(f"❌ Failed to research task {i}",
-                                    error=research_result.get('error', 'Unknown error'))
+                                    error=error_msg,
+                                    success=research_success,
+                                    content_length=len(research_content))
                 
                 except Exception as e:
                     failed_tasks.append(task_structure)

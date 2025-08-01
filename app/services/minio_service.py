@@ -15,13 +15,19 @@ class MinIOService:
     
     def __init__(self):
         self.client = Minio(
-            settings.minio_endpoint,
+            endpoint=settings.minio_endpoint,
             access_key=settings.minio_access_key,
             secret_key=settings.minio_secret_key,
-            secure=settings.minio_secure
+            secure=settings.minio_secure,
+            region=settings.minio_region
         )
         self.bucket_name = settings.minio_bucket_name
         self._ensure_bucket_exists()
+        
+        logger.info("--- noit-web-research-system MinIO Configuration ---")
+        logger.info(f"Endpoint: {settings.minio_endpoint}")
+        logger.info(f"Bucket: {self.bucket_name}")
+        logger.info("---------------------------------------------")
     
     def _ensure_bucket_exists(self):
         """Ensure the bucket exists, create if not"""
@@ -176,6 +182,56 @@ class MinIOService:
             
         except S3Error as e:
             logger.error(f"Error listing directory files: {e}")
+            raise
+    
+    async def list_directory_contents(
+        self, 
+        directory_path: str,
+        max_age_days: int = 90
+    ) -> List[str]:
+        """
+        List all contents (files and folders) in a directory
+        
+        Args:
+            directory_path: Directory path to list
+            max_age_days: Maximum age of files to include
+            
+        Returns:
+            List of object names/paths in the directory
+        """
+        
+        # Ensure directory path doesn't start with / but ends with /
+        directory_path = directory_path.strip('/') + '/' if directory_path.strip('/') else ''
+        
+        try:
+            logger.info(f"📁 Listing MinIO directory contents: {directory_path}")
+            
+            objects = await asyncio.get_event_loop().run_in_executor(
+                None,
+                list,
+                self.client.list_objects(
+                    self.bucket_name,
+                    prefix=directory_path,
+                    recursive=True
+                )
+            )
+            
+            content_list = []
+            cutoff_date = datetime.utcnow() - timedelta(days=max_age_days)
+            
+            for obj in objects:
+                # Include both files and directories
+                # Filter by age for files (directories don't have meaningful last_modified)
+                if not obj.object_name.endswith('/') and obj.last_modified < cutoff_date:
+                    continue
+                
+                content_list.append(obj.object_name)
+            
+            logger.info(f"📂 Found {len(content_list)} items in directory: {directory_path}")
+            return content_list
+            
+        except S3Error as e:
+            logger.error(f"❌ Error listing directory contents: {e}")
             raise
     
     async def get_directory_content_summary(

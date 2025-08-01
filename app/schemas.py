@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 from enum import Enum
 
@@ -43,7 +43,16 @@ class ResearchCreateRequest(BaseModel):
     llm_provider: LLMProvider = Field(default=LLMProvider.OPENAI, description="LLM provider to use")
     llm_model: str = Field(default="gpt-4o-mini", description="Specific LLM model to use")
     perplexity_model: PerplexityModel = Field(default=PerplexityModel.SONAR_PRO, description="Perplexity model to use")
-    max_planning_tasks: int = Field(default=8, ge=1, le=20, description="Maximum number of research tasks to create")
+    max_planning_tasks: int = Field(
+        default=8, 
+        ge=1, 
+        le=20, 
+        description="Maximum number of research tasks to create. Use 1 to preserve the original query exactly without LLM modification for complex instructions like JSON formatting."
+    )
+    # Callback fields
+    callback_enabled: bool = Field(default=False, description="Whether to send callback when research is completed")
+    callback_url: Optional[str] = Field(default=None, description="URL to send callback to when research is completed")
+    callback_data: Optional[Dict[str, Any]] = Field(default=None, description="Additional data to include in callback")
 
 
 class ResearchUpdateRequest(BaseModel):

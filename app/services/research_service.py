@@ -47,7 +47,12 @@ class ResearchService:
                        llm_provider=research_request.llm_provider.value,
                        llm_model=research_request.llm_model,
                        perplexity_model=research_request.perplexity_model.value,
-                       max_planning_tasks=research_request.max_planning_tasks)
+                       max_planning_tasks=research_request.max_planning_tasks,
+                       callback_enabled=research_request.callback_enabled,
+                       callback_url=research_request.callback_url)
+            
+            logger.info(f"🔍 PERPLEXITY MODEL TRACKING: Received model '{research_request.perplexity_model.value}' from request")
+            logger.info(f"📁 DIRECTORY PATH TRACKING: Received directory_path '{research_request.directory_path}' from request")
             
             # Create research record
             research = Research(
@@ -56,7 +61,10 @@ class ResearchService:
                 status=ResearchStatus.PENDING.value,
                 llm_provider=research_request.llm_provider.value,
                 llm_model=research_request.llm_model,
-                perplexity_model=research_request.perplexity_model.value
+                perplexity_model=research_request.perplexity_model.value,
+                callback_enabled=research_request.callback_enabled,
+                callback_url=research_request.callback_url,
+                callback_data=research_request.callback_data
             )
             
             db.add(research)
@@ -64,6 +72,7 @@ class ResearchService:
             db.refresh(research)
             
             logger.info(f"✅ Created research record", research_id=research.id)
+            logger.info(f"📁 DIRECTORY PATH TRACKING: Stored in DB as '{research.directory_path}'")
             
             # Update status to in_progress
             research.status = ResearchStatus.IN_PROGRESS.value
@@ -79,12 +88,18 @@ class ResearchService:
                 "llm_provider": research_request.llm_provider.value,
                 "llm_model": research_request.llm_model,
                 "perplexity_model": research_request.perplexity_model.value,
-                "max_planning_tasks": research_request.max_planning_tasks
+                "max_planning_tasks": research_request.max_planning_tasks,
+                "callback_enabled": research_request.callback_enabled,
+                "callback_url": research_request.callback_url,
+                "callback_data": research_request.callback_data
             }
             
             logger.info(f"📋 Prepared flow inputs",
                        research_id=research.id,
                        flow_inputs=flow_inputs)
+            
+            logger.info(f"🔍 PERPLEXITY MODEL TRACKING: Flow inputs contain model '{flow_inputs.get('perplexity_model')}'")
+            logger.info(f"📁 DIRECTORY PATH TRACKING: Flow inputs contain directory_path '{flow_inputs.get('directory_path')}'")
             
             # Execute the research flow by passing the inputs dictionary and database session
             logger.info(f"🚀 Starting research flow execution", research_id=research.id)
@@ -330,7 +345,7 @@ class ResearchService:
             
             # Update research status
             research.status = flow_result.status.value
-            research.completed_at = datetime.utcnow() if flow_result.status in [
+            research.completed_at = datetime.now(UTC) if flow_result.status in [
                 ResearchStatus.COMPLETED, ResearchStatus.FAILED
             ] else None
             
@@ -366,7 +381,7 @@ class ResearchService:
                         task_order=task_order,
                         status=TaskStatus.COMPLETED.value,
                         minio_file_path=minio_file,
-                        completed_at=datetime.utcnow()
+                        completed_at=datetime.now(UTC)
                     )
                     db.add(task)
                     logger.info(f"📝 Created completed task",
@@ -398,7 +413,7 @@ class ResearchService:
                         task_order=task_order,
                         status=TaskStatus.FAILED.value,
                         minio_file_path=None,
-                        completed_at=datetime.utcnow()
+                        completed_at=datetime.now(UTC)
                     )
                     db.add(task)
                     logger.info(f"📝 Created failed task",
@@ -423,8 +438,50 @@ class ResearchService:
                 )
                 db.add(similar_research)
             
+            # Commit all changes to database FIRST
             db.commit()
             logger.info(f"✅ Successfully updated research with flow results", research_id=research.id)
+            
+            # Send callback AFTER updating the status - only if research is completed or failed
+            if research.callback_enabled and research.callback_url and research.status in [
+                ResearchStatus.COMPLETED.value, ResearchStatus.FAILED.value
+            ]:
+                logger.info(f"📞 Sending callback after research completion",
+                           research_id=research.id,
+                           callback_url=research.callback_url,
+                           final_status=research.status)
+                
+                try:
+                    # Import callback service here to avoid circular imports
+                    from app.services.callback_service import callback_service
+                    
+                    # Refresh research to get latest data including tasks
+                    db.refresh(research)
+                    
+                    # Prepare research summary
+                    research_summary = callback_service.prepare_research_summary(research)
+                    
+                    # Get research files
+                    research_files = []
+                    if research.tasks:
+                        research_files = [task.minio_file_path for task in research.tasks if task.minio_file_path]
+                    
+                    # Send callback with the updated status
+                    callback_success = await callback_service.send_research_callback(
+                        db=db,
+                        research=research,
+                        research_content=research_summary,
+                        research_files=research_files
+                    )
+                    
+                    if callback_success:
+                        logger.info(f"✅ Callback sent successfully for research {research.id}")
+                    else:
+                        logger.warning(f"⚠️ Failed to send callback for research {research.id}")
+                        
+                except Exception as callback_error:
+                    logger.error(f"❌ Error sending callback for research {research.id}: {str(callback_error)}")
+                    # Don't raise the error - callback failure shouldn't fail the research
             
         except Exception as e:
             logger.error(f"❌ Error updating research with flow result", research_id=research.id, error=str(e))
@@ -464,7 +521,7 @@ class ResearchService:
         
         # Recent researches (last 7 days)
         from datetime import timedelta
-        seven_days_ago = datetime.utcnow() - timedelta(days=7)
+        seven_days_ago = datetime.now(UTC) - timedelta(days=7)
         recent_researches = db.query(Research).filter(
             Research.created_at >= seven_days_ago
         ).count()

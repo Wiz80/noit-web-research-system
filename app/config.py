@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from typing import Optional
 import os
 from dotenv import load_dotenv
@@ -20,11 +21,12 @@ class Settings(BaseSettings):
     perplexity_api_key: Optional[str] 
     
     # MinIO Configuration
-    minio_endpoint: str = "localhost:9000"
-    minio_access_key: str = "minioadmin"
-    minio_secret_key: str = "minioadmin"
-    minio_bucket_name: str = "research-storage"
-    minio_secure: bool = False
+    minio_endpoint: str
+    minio_access_key: str = Field(alias="MINIO_ROOT_USER")
+    minio_secret_key: str = Field(alias="MINIO_ROOT_PASSWORD")
+    minio_bucket_name: str
+    minio_secure: bool = Field(alias="MINIO_USE_SSL")
+    minio_region: Optional[str] = None
     
     # Application Settings
     app_env: str = "development"

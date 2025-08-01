@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean, JSON
 from sqlalchemy.orm import relationship
 from datetime import datetime, UTC
 from app.database import Base
@@ -9,7 +9,7 @@ class Research(Base):
     __tablename__ = "researches"
     
     id = Column(Integer, primary_key=True, index=True)
-    query = Column(Text, nullable=False, index=True)  # Original research question/input
+    query = Column(Text, nullable=False)  # Original research question/input (removed index=True due to size limits)
     directory_path = Column(String(500), nullable=False)  # MinIO directory path
     status = Column(String(50), default="pending")  # pending, in_progress, completed, failed
     created_at = Column(DateTime, default=datetime.now(UTC))
@@ -22,6 +22,13 @@ class Research(Base):
     
     # Perplexity Configuration used
     perplexity_model = Column(String(100), default="sonar-pro")  # sonar-pro, sonar-deep-research, etc.
+    
+    # Callback fields
+    callback_enabled = Column(Boolean, default=False)
+    callback_url = Column(String(500), nullable=True)
+    callback_data = Column(JSON, nullable=True)
+    callback_sent = Column(Boolean, default=False)
+    callback_sent_at = Column(DateTime, nullable=True)
     
     # Relationships
     tasks = relationship("ResearchTask", back_populates="research", cascade="all, delete-orphan")

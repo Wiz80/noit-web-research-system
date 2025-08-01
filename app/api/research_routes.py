@@ -50,6 +50,76 @@ async def create_research(
         
         logger.info(f"Successfully created research with ID: {research_response.id}")
         
+        # DEBUGGING LOGS - Información detallada post-ejecución
+        logger.info(f"🔍 DEBUGGING - Research execution completed", 
+                   research_id=research_response.id,
+                   final_status=research_response.status)
+        
+        # Obtener la investigación actualizada con todas las tareas
+        updated_research = research_service.get_research(db, research_response.id)
+        
+        if updated_research and updated_research.tasks:
+            logger.info(f"📁 DEBUGGING - MinIO Files Generated",
+                       research_id=updated_research.id,
+                       total_tasks=len(updated_research.tasks),
+                       minio_files=[task.minio_file_path for task in updated_research.tasks if task.minio_file_path])
+            
+            # Log detallado de cada archivo generado
+            for i, task in enumerate(updated_research.tasks, 1):
+                if task.minio_file_path:
+                    logger.info(f"📄 DEBUGGING - Task {i} MinIO File",
+                               research_id=updated_research.id,
+                               task_order=task.task_order,
+                               task_query=task.task_query,
+                               minio_file_path=task.minio_file_path,
+                               task_status=task.status)
+        
+        # Log de información del callback si está habilitado
+        if research_request.callback_enabled and research_request.callback_url:
+            logger.info(f"📞 DEBUGGING - Callback Configuration",
+                       research_id=research_response.id,
+                       callback_url=research_request.callback_url,
+                       callback_enabled=research_request.callback_enabled,
+                       callback_data=research_request.callback_data,
+                       research_status=research_response.status)
+            
+            # Si la investigación ya terminó, log de lo que se va a enviar en el callback
+            if research_response.status in ["completed", "failed"]:
+                try:
+                    # Importar callback service para obtener el summary
+                    from app.services.callback_service import callback_service
+                    
+                    # Preparar el summary que se enviará
+                    research_summary = callback_service.prepare_research_summary(updated_research)
+                    
+                    # Obtener archivos de investigación
+                    research_files = []
+                    if updated_research and updated_research.tasks:
+                        research_files = [task.minio_file_path for task in updated_research.tasks if task.minio_file_path]
+                    
+                    logger.info(f"📋 DEBUGGING - Callback Payload Preview",
+                               research_id=research_response.id,
+                               callback_url=research_request.callback_url,
+                               research_summary_length=len(research_summary) if research_summary else 0,
+                               research_files_count=len(research_files),
+                               research_files=research_files,
+                               callback_data=research_request.callback_data)
+                    
+                    # Log del contenido del summary (primeros 200 caracteres para debugging)
+                    if research_summary:
+                        summary_preview = research_summary[:200] + "..." if len(research_summary) > 200 else research_summary
+                        logger.info(f"📝 DEBUGGING - Research Summary Preview",
+                                   research_id=research_response.id,
+                                   summary_preview=summary_preview)
+                        
+                except Exception as callback_debug_error:
+                    logger.warning(f"⚠️ DEBUGGING - Error getting callback preview: {str(callback_debug_error)}")
+        else:
+            logger.info(f"🚫 DEBUGGING - Callback Disabled",
+                       research_id=research_response.id,
+                       callback_enabled=research_request.callback_enabled,
+                       callback_url=research_request.callback_url)
+        
         return research_response
         
     except Exception as e:
@@ -289,4 +359,4 @@ def health_check():
         "service": "web-research-system",
         "version": "1.0.0",
         "timestamp": "2024-01-01T00:00:00Z"  # You can use datetime.utcnow().isoformat()
-    } 
+    }
